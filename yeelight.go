@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -42,8 +43,8 @@ type (
 
 	// Notification represents notification response
 	Notification struct {
-		Method string            `json:"method"`
-		Params map[string]string `json:"params"`
+		Method string                 `json:"method"`
+		Params map[string]interface{} `json:"params"`
 	}
 
 	//Error struct represents error part of response
@@ -52,19 +53,29 @@ type (
 		Message string `json:"message"`
 	}
 
+	State struct {
+		Address    string
+		Name       string
+		Power      string
+		Brightness string
+	}
+
 	//Yeelight represents device
 	Yeelight struct {
-		addr string
-		rnd  *rand.Rand
+		addr  string
+		rnd   *rand.Rand
+		state State
 	}
 )
+
+var id int = 0
 
 //Discover discovers device in local network via ssdp
 func Discover() (*Yeelight, error) {
 	var err error
 
 	ssdp, _ := net.ResolveUDPAddr("udp4", ssdpAddr)
-	c, _ := net.ListenPacket("udp4", ":0")
+	c, _ := net.ListenPacket("udp4", getIP()+":0")
 	socket := c.(*net.UDPConn)
 	socket.WriteToUDP([]byte(discoverMSG), ssdp)
 	socket.SetReadDeadline(time.Now().Add(timeout))
@@ -75,66 +86,63 @@ func Discover() (*Yeelight, error) {
 		return nil, errors.New("no devices found")
 	}
 	rs := rsBuf[0:size]
-	addr := parseAddr(string(rs))
-	fmt.Printf("Device with ip %s found\n", addr)
-	return New(addr), nil
+	state, err := parseState(string(rs))
+	return New(*state), nil
 
 }
 
 //New creates new device instance for address provided
-func New(addr string) *Yeelight {
+func New(state State) *Yeelight {
 	return &Yeelight{
-		addr: addr,
-		rnd:  rand.New(rand.NewSource(time.Now().UnixNano())),
+		addr:  state.Address,
+		state: state,
+		rnd:   rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
 }
 
+func (y *Yeelight) GetState() State {
+	return y.state
+}
+
 // Listen connects to device and listens for NOTIFICATION events
-func (y *Yeelight) Listen() (<-chan *Notification, chan<- struct{}, error) {
+func (y *Yeelight) Listen() (<-chan *Notification, error) {
 	var err error
 	notifCh := make(chan *Notification)
-	done := make(chan struct{}, 1)
 
 	conn, err := net.DialTimeout("tcp", y.addr, time.Second*3)
 	if err != nil {
-		return nil, nil, fmt.Errorf("cannot connect to %s. %s", y.addr, err)
+		return nil, fmt.Errorf("cannot connect to %s. %s", y.addr, err)
 	}
 
-	fmt.Println("Connection established")
+	//fmt.Println("Connection established")
 	go func(c net.Conn) {
 		//make sure connection is closed when method returns
 		defer closeConnection(conn)
 
 		connReader := bufio.NewReader(c)
 		for {
-			select {
-			case <-done:
-				return
-			default:
-				data, err := connReader.ReadString('\n')
-				if nil == err {
-					var rs Notification
-					fmt.Println(data)
-					json.Unmarshal([]byte(data), &rs)
-					select {
-					case notifCh <- &rs:
-					default:
-						fmt.Println("Channel is full")
-					}
+			data, err := connReader.ReadString('\n')
+			if nil == err {
+				var rs Notification
+				//fmt.Println(data)
+				json.Unmarshal([]byte(data), &rs)
+				//fmt.Printf("%+v\n", rs.Params)
+				select {
+				case notifCh <- &rs:
+				default:
+					fmt.Println("Channel is full")
 				}
 			}
-
 		}
-
 	}(conn)
 
-	return notifCh, done, nil
+	return notifCh, nil
 }
 
 // GetProp method is used to retrieve current property of smart LED.
 func (y *Yeelight) GetProp(values ...interface{}) ([]interface{}, error) {
-	r, err := y.executeCommand("get_prop", values...)
+	r, err := y.executeCommand("get_prop", values)
 	if nil != err {
 		return nil, err
 	}
@@ -142,14 +150,17 @@ func (y *Yeelight) GetProp(values ...interface{}) ([]interface{}, error) {
 }
 
 //SetPower is used to switch on or off the smart LED (software managed on/off).
-func (y *Yeelight) SetPower(on bool) error {
-	var status string
-	if on {
-		status = "on"
-	} else {
-		status = "off"
+func (y *Yeelight) SetPower(on string) error {
+	_, err := y.executeCommand("set_power", []interface{}{on, "sudden", 0})
+	return err
+}
+
+func (y *Yeelight) SetBright(bright string) error {
+	br, err := strconv.Atoi(bright)
+	if err != nil {
+		return err
 	}
-	_, err := y.executeCommand("set_power", status)
+	_, err = y.executeCommand("set_bright", []interface{}{br, "sudden", 0})
 	return err
 }
 
@@ -159,15 +170,16 @@ func (y *Yeelight) randID() int {
 }
 
 func (y *Yeelight) newCommand(name string, params []interface{}) *Command {
+	id = id + 1
 	return &Command{
 		Method: name,
-		ID:     y.randID(),
+		ID:     id,
 		Params: params,
 	}
 }
 
 //executeCommand executes command with provided parameters
-func (y *Yeelight) executeCommand(name string, params ...interface{}) (*CommandResult, error) {
+func (y *Yeelight) executeCommand(name string, params []interface{}) (*CommandResult, error) {
 	return y.execute(y.newCommand(name, params))
 }
 
@@ -178,11 +190,14 @@ func (y *Yeelight) execute(cmd *Command) (*CommandResult, error) {
 	if nil != err {
 		return nil, fmt.Errorf("cannot open connection to %s. %s", y.addr, err)
 	}
-	time.Sleep(time.Second)
+	defer conn.Close()
+
+	//time.Sleep(time.Second)
 	conn.SetReadDeadline(time.Now().Add(timeout))
 
 	//write request/command
 	b, _ := json.Marshal(cmd)
+	//fmt.Println(string(b))
 	fmt.Fprint(conn, string(b)+crlf)
 
 	//wait and read for response
@@ -201,18 +216,23 @@ func (y *Yeelight) execute(cmd *Command) (*CommandResult, error) {
 	return &rs, nil
 }
 
-//parseAddr parses address from ssdp response
-func parseAddr(msg string) string {
+func parseState(msg string) (*State, error) {
 	if strings.HasSuffix(msg, crlf) {
 		msg = msg + crlf
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(strings.NewReader(msg)), nil)
 	if err != nil {
 		fmt.Println(err)
-		return ""
+		return nil, err
 	}
 	defer resp.Body.Close()
-	return strings.TrimPrefix(resp.Header.Get("LOCATION"), "yeelight://")
+
+	return &State{
+		Address:    strings.TrimPrefix(resp.Header.Get("LOCATION"), "yeelight://"),
+		Name:       resp.Header.Get("NAME"),
+		Power:      resp.Header.Get("POWER"),
+		Brightness: resp.Header.Get("BRIGHT"),
+	}, nil
 }
 
 //closeConnection closes network connection
